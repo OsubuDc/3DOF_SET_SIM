@@ -1,0 +1,26 @@
+{
+  "name": "3DOF_Testbench",
+  "dockerFile": "Dockerfile",
+  "runArgs": [
+    "--privileged",
+    "--network=host",
+    "-e", "DISPLAY",
+    "-e", "XDG_RUNTIME_DIR",
+    "-v", "/tmp/.X11-unix:/tmp/.X11-unix:rw",
+    "-v", "/run/user/1000:/run/user/1000:rw"
+  ],
+  "workspaceMount": "source=${localWorkspaceFolder},target=/${localWorkspaceFolderBasename},type=bind",
+  "workspaceFolder": "/${localWorkspaceFolderBasename}",
+  "mounts": [
+    "source=${localEnv:HOME}${localEnv:USERPROFILE}/.bash_history,target=/home/vscode/.bash_history,type=bind"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "smilerobotics.urdf",
+        "ms-vscode.cmake-tools"
+      ]
+    }
+  }
+}
