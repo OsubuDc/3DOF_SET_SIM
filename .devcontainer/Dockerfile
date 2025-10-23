@@ -36,3 +36,12 @@ RUN echo "source /opt/ros/${ROS_DISTRO}/setup.bash" >> ~/.bashrc
 ################################
 ## ADD ANY CUSTOM SETUP BELOW ##
 ################################
+# Install dependencies
+RUN sudo apt-get update && sudo apt-get install -y \
+    nano \
+    lsb-release \
+    curl \
+    ros-humble-robot-state-publisher \
+    ros-humble-joint-state-publisher \
+    ros-humble-joint-state-publisher-gui \
+    && sudo rm -rf /var/lib/apt/lists/*
