@@ -44,4 +44,5 @@ RUN sudo apt-get update && sudo apt-get install -y \
     ros-humble-robot-state-publisher \
     ros-humble-joint-state-publisher \
     ros-humble-joint-state-publisher-gui \
+    ros-humble-joint-limits \
     && sudo rm -rf /var/lib/apt/lists/*

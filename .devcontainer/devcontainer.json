@@ -19,7 +19,8 @@
       "extensions": [
         "ms-python.python",
         "smilerobotics.urdf",
-        "ms-vscode.cmake-tools"
+        "ms-vscode.cmake-tools",
+        "ms-vscode.cpptools"
       ]
     }
   }
