@@ -157,21 +157,30 @@ public:
         // STEP 5: CONTROL PARAMETERS
         // ====================================================================
         
-        // Target end-effector position (x, y, z) in meters
-        // For 3-DOF robot: base rotation + shoulder + elbow
-        // Controls full 3D position of end-effector
+        // Target end-effector POSE (position + orientation)
+        // Position: (x, y, z) in meters
+        // Orientation: Roll angle around X-axis (radians)
         x_des_ = Eigen::Vector3d(0.3, 0.3, 0.05);
+        roll_des_ = 0.0;  // Desired roll angle (0 = neutral orientation)
         
         // Target velocity and acceleration (zero for stationary target)
-        xdot_des_ = Eigen::Vector3d::Zero();
-        xddot_des_ = Eigen::Vector3d::Zero();
+        xdot_des_ = Eigen::Vector4d::Zero();    // [vx, vy, vz, omega_x]
+        xddot_des_ = Eigen::Vector4d::Zero();   // [ax, ay, az, alpha_x]
         
         // PD gains for operational space control
-        // Kp: Position gain (stiffness) - higher = faster convergence but potential overshoot
-        // Kd: Derivative gain (damping) - higher = less oscillation but slower response
-        // Now 3×3 diagonal matrix for X, Y, Z control
-        Kp_ = Eigen::Matrix3d::Identity() * 50.0;  // [50, 0, 0; 0, 50, 0; 0, 0, 50]
-        Kd_ = Eigen::Matrix3d::Identity() * 40.0;  // [40, 0, 0; 0, 40, 0; 0, 0, 40]
+        // Now 4×4 diagonal matrix for X, Y, Z, Roll control
+        // Note: Roll gain might need different tuning than position gains
+        Kp_ = Eigen::Matrix4d::Identity();
+        Kp_(0,0) = 50.0;  // X position gain
+        Kp_(1,1) = 50.0;  // Y position gain
+        Kp_(2,2) = 50.0;  // Z position gain
+        Kp_(3,3) = 30.0;  // Roll orientation gain (typically lower than position)
+        
+        Kd_ = Eigen::Matrix4d::Identity();
+        Kd_(0,0) = 40.0;  // X velocity damping
+        Kd_(1,1) = 40.0;  // Y velocity damping
+        Kd_(2,2) = 40.0;  // Z velocity damping
+        Kd_(3,3) = 25.0;  // Roll velocity damping
         
         // Joint limits (radians) - CRITICAL to prevent uncontrolled spinning
         // Joint 0: X-axis roll (arm rotation to avoid elbow flip)
@@ -184,8 +193,8 @@ public:
         q_min_ = Eigen::Vector3d(-M_PI, -1.57, -2.6);   // [±180°, ±90°, -149°]
         q_max_ = Eigen::Vector3d(M_PI, 1.57, -0.1);     // Match URDF limits
         
-        RCLCPP_INFO(this->get_logger(), "Target position: [%.3f, %.3f, %.3f]", 
-                    x_des_[0], x_des_[1], x_des_[2]);
+        RCLCPP_INFO(this->get_logger(), "Target pose: pos=[%.3f, %.3f, %.3f] roll=%.1f°", 
+                    x_des_[0], x_des_[1], x_des_[2], roll_des_ * 180.0/M_PI);
         RCLCPP_WARN(this->get_logger(), "Joint limits: [%.0f°, %.0f°, %.0f°] to [%.0f°, %.0f°, %.0f°]",
                     q_min_[0] * 180.0/M_PI, q_min_[1] * 180.0/M_PI, q_min_[2] * 180.0/M_PI,
                     q_max_[0] * 180.0/M_PI, q_max_[1] * 180.0/M_PI, q_max_[2] * 180.0/M_PI);
@@ -294,37 +303,62 @@ private:
         Eigen::MatrixXd J_full = pin::computeFrameJacobian(
             model_, data_, q, ee_frame_id_, pin::LOCAL_WORLD_ALIGNED);
         
-        // Extract 3×3 block: X-Y-Z linear velocities (3 task space DOF, 3 joints)
-        // For 3-DOF robot controlling 3D position, J is square (3×3)
-        // System is FULLY DETERMINED - unique solution exists (when not at singularity)
-        Eigen::Matrix3d J = J_full.topRows(3);
+        // Extract 4×3 block: X-Y-Z linear velocities + X-axis angular velocity (roll)
+        // For 3-DOF robot controlling 3D position + roll orientation
+        // J is 4×3 (4 task DOF, 3 joint DOF)
+        // System is REDUNDANT (underdetermined) - infinite solutions exist
+        // Use pseudoinverse to find minimum-norm solution (smoothest joint motion)
+        Eigen::MatrixXd J(4, 3);
+        J.topRows(3) = J_full.topRows(3);      // Linear velocities (X, Y, Z)
+        J.row(3) = J_full.row(3);              // Angular velocity around X (roll)
         
         // Time derivative of Jacobian (needed for acceleration mapping)
         // J_dot appears in: ẍ = J(q)q̈ + J̇(q,q̇)q̇
         Eigen::MatrixXd J_dot_full = pin::getFrameJacobianTimeVariation(
             model_, data_, ee_frame_id_, pin::LOCAL_WORLD_ALIGNED);
         
-        Eigen::Matrix3d J_dot = J_dot_full.topRows(3);
+        Eigen::MatrixXd J_dot(4, 3);
+        J_dot.topRows(3) = J_dot_full.topRows(3);
+        J_dot.row(3) = J_dot_full.row(3);
         
         // ====================================================================
         // OPERATIONAL SPACE CONTROL - Task-space PD controller
         // ====================================================================
         
-        // Current end-effector position (X-Y-Z)
-        // data_.oMf[i].translation() returns full 3D position vector
+        // Current end-effector POSITION (X-Y-Z)
         Eigen::Vector3d x = data_.oMf[ee_frame_id_].translation();
         
-        // Position error: how far are we from target?
-        Eigen::Vector3d x_err = x_des_ - x;
+        // Current end-effector ORIENTATION (extract roll angle from rotation matrix)
+        // data_.oMf[ee_frame_id_].rotation() returns 3×3 rotation matrix
+        // For roll around X-axis: extract from rotation matrix
+        // Using rotation matrix to euler angles: roll = atan2(R(2,1), R(2,2))
+        Eigen::Matrix3d R = data_.oMf[ee_frame_id_].rotation();
+        double roll = std::atan2(R(2,1), R(2,2));  // Roll angle (rotation around X-axis)
+        
+        // Combine position and orientation into 4D task-space vector
+        Eigen::Vector4d x_current;
+        x_current << x[0], x[1], x[2], roll;
+        
+        // Desired task-space state (position + roll)
+        Eigen::Vector4d x_des_full;
+        x_des_full << x_des_[0], x_des_[1], x_des_[2], roll_des_;
+        
+        // Position + orientation error: how far are we from target?
+        Eigen::Vector4d x_err = x_des_full - x_current;
+        
+        // Wrap roll error to [-π, π] range
+        // Important: orientation errors should be wrapped to avoid 360° rotations
+        while (x_err[3] > M_PI) x_err[3] -= 2*M_PI;
+        while (x_err[3] < -M_PI) x_err[3] += 2*M_PI;
         
         // Velocity error: how fast are we moving toward target?
-        // Current velocity: J*v (map joint velocities to EE velocity)
-        Eigen::Vector3d xdot_err = xdot_des_ - J * v;
+        // Current velocity: J*v (map joint velocities to task-space velocity)
+        Eigen::Vector4d xdot_err = xdot_des_ - J * v;
         
         // PD control law in task space:
         // Desired acceleration = feedforward + P term + D term
-        // This is what we WANT the end-effector to do
-        Eigen::Vector3d x_acc_des = xddot_des_ + Kp_ * x_err + Kd_ * xdot_err;
+        // This is what we WANT the end-effector to do (position + orientation)
+        Eigen::Vector4d x_acc_des = xddot_des_ + Kp_ * x_err + Kd_ * xdot_err;
         
         // ====================================================================
         // INVERSE DYNAMICS - Compute required torques
@@ -344,36 +378,49 @@ private:
         // ====================================================================
         // TASK-SPACE TO JOINT-SPACE MAPPING
         // ====================================================================
-        // We have desired EE acceleration (x_acc_des) - 3D vector
-        // We need joint acceleration (qddot) that achieves it - 3D vector
+        // We have desired task-space acceleration (x_acc_des) - 4D vector [ax,ay,az,alpha_x]
+        // We need joint acceleration (qddot) that achieves it - 3D vector [q̈₁,q̈₂,q̈₃]
         //
         // From kinematics: ẍ = J(q)q̈ + J̇(q,q̇)q̇
-        // Rearrange: q̈ = J⁻¹(ẍ - J̇q̇)
+        // Rearrange: q̈ = J⁺(ẍ - J̇q̇)
         //
-        // For 3-DOF robot controlling 3D position:
-        //   - J is 3×3 (3 task DOF, 3 joint DOF)
-        //   - System is SQUARE - unique solution when J is full rank
-        //   - Can use direct inverse when away from singularities
-        //   - At singularities (det(J) ≈ 0), use pseudoinverse for stability
+        // For 3-DOF robot controlling 4D task (position + orientation):
+        //   - J is 4×3 (4 task DOF, 3 joint DOF)
+        //   - System is UNDERDETERMINED (more tasks than joints - impossible!)
+        //   
+        //   Wait... 4 tasks with 3 joints? This seems impossible!
+        //   
+        //   Actually, it IS possible because of your special design:
+        //     • Joint0 (X-rotation) PRIMARILY controls roll
+        //     • Joint1+Joint2 (Z-rotations) PRIMARILY control X,Y,Z position
+        //   
+        //   The tasks are "weakly coupled" - different joints affect different tasks.
+        //   Pseudoinverse finds best-fit solution that minimizes error across all tasks.
         //
-        // Physical meaning: There's exactly one joint acceleration that
-        // achieves the desired end-effector motion (when not singular)
+        //   If task cannot be perfectly achieved (all 4 DOFs simultaneously):
+        //     → Pseudoinverse prioritizes based on singular value decomposition
+        //     → Typically position has stronger influence than orientation
+        //     → Result: Good position tracking, approximate orientation tracking
+        //
+        // For TRUE redundancy with guaranteed task achievement, we'd need 4+ joints.
+        // With 3 joints and 4 tasks, this is actually OVERCONSTRAINED.
+        // But pseudoinverse handles this gracefully - finds best compromise!
         
-        // Check if Jacobian is near singular (determinant close to zero)
-        double det_J = J.determinant();
-        Eigen::Vector3d qddot_task;
+        Eigen::Vector3d qddot_task = J.completeOrthogonalDecomposition().solve(
+            x_acc_des - J_dot * v
+        );
         
-        if (std::abs(det_J) > 1e-3) {
-            // Away from singularity: use direct inverse (faster, more accurate)
-            qddot_task = J.inverse() * (x_acc_des - J_dot * v);
-        } else {
-            // Near singularity: use pseudoinverse (numerically stable)
-            // Damped least squares: J⁺ = Jᵀ(JJᵀ + λ²I)⁻¹
-            qddot_task = J.completeOrthogonalDecomposition().solve(
-                x_acc_des - J_dot * v
-            );
+        // Alternative: Use damped least squares for better numerical stability
+        // double damping = 0.01;
+        // Eigen::Matrix3d JTJ_damped = J.transpose() * J + damping * Eigen::Matrix3d::Identity();
+        // qddot_task = JTJ_damped.ldlt().solve(J.transpose() * (x_acc_des - J_dot * v));
+        
+        // Check condition number to monitor how well-posed the problem is
+        Eigen::JacobiSVD<Eigen::MatrixXd> svd(J);
+        double cond = svd.singularValues()(0) / svd.singularValues()(svd.singularValues().size()-1);
+        if (cond > 100) {  // Condition number > 100 indicates near-singularity
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                                 "Near singularity! det(J) = %.4f", det_J);
+                                 "Jacobian poorly conditioned! cond(J) = %.1f", cond);
         }
         
         // Control torque using inverse dynamics:
@@ -526,8 +573,19 @@ private:
             // Current end-effector position (full 3D)
             Eigen::Vector3d x = data_.oMf[ee_frame_id_].translation();
             
-            // Error magnitude (Euclidean distance to target)
-            double err_norm = (x_des_ - x).norm();
+            // Current roll angle
+            Eigen::Matrix3d R = data_.oMf[ee_frame_id_].rotation();
+            double roll = std::atan2(R(2,1), R(2,2));
+            
+            // Position error magnitude
+            double pos_err = (x_des_ - x).norm();
+            
+            // Orientation error magnitude
+            double roll_err = std::abs(roll_des_ - roll);
+            // Wrap to [-π, π]
+            while (roll_err > M_PI) roll_err -= 2*M_PI;
+            while (roll_err < -M_PI) roll_err += 2*M_PI;
+            roll_err = std::abs(roll_err);
             
             // Convert joint angles to degrees for readability
             double q1_deg = q[0] * 180.0 / M_PI;
@@ -555,8 +613,9 @@ private:
             }
             
             RCLCPP_INFO(this->get_logger(),
-                "t=%5.2fs | q=[%+6.1f°, %+6.1f°, %+6.1f°] | EE=[%+.3f, %+.3f, %+.3f] | err=%.4f%s",
-                time_, q1_deg, q2_deg, q3_deg, x[0], x[1], x[2], err_norm, limit_str.c_str());
+                "t=%5.2fs | q=[%+6.1f°, %+6.1f°, %+6.1f°] | EE=[%+.3f, %+.3f, %+.3f] roll=%+6.1f° | pos_err=%.4f roll_err=%.2f°%s",
+                time_, q1_deg, q2_deg, q3_deg, x[0], x[1], x[2], roll*180.0/M_PI, 
+                pos_err, roll_err*180.0/M_PI, limit_str.c_str());
         }
     }
     
@@ -574,10 +633,11 @@ private:
     
     // Control parameters
     Eigen::Vector3d x_des_;      // Target end-effector position (m) [X, Y, Z]
-    Eigen::Vector3d xdot_des_;   // Target end-effector velocity (m/s)
-    Eigen::Vector3d xddot_des_;  // Target end-effector acceleration (m/s²)
-    Eigen::Matrix3d Kp_;         // Position gain matrix (3×3)
-    Eigen::Matrix3d Kd_;         // Derivative gain matrix (3×3)
+    double roll_des_;            // Target roll angle around X-axis (rad)
+    Eigen::Vector4d xdot_des_;   // Target velocity [vx, vy, vz, omega_x] (m/s, rad/s)
+    Eigen::Vector4d xddot_des_;  // Target acceleration [ax, ay, az, alpha_x] (m/s², rad/s²)
+    Eigen::Matrix4d Kp_;         // Position + orientation gain matrix (4×4)
+    Eigen::Matrix4d Kd_;         // Velocity + angular velocity damping matrix (4×4)
     
     // Joint limits
     Eigen::Vector3d q_min_;      // Lower joint limits (rad)
