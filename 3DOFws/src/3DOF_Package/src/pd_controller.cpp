@@ -2,6 +2,53 @@
 // ROS2 C++ node for simulating a 2-DOF robotic arm with operational space control
 
 // ============================================================================
+// MOTOR DYNAMICS AND URDF TRANSMISSION
+// ============================================================================
+//
+// URDF Support for Motor Models:
+// --------------------------------
+// URDF files CAN specify transmission elements that define motor properties:
+//
+// <transmission name="joint1_trans">
+//   <type>transmission_interface/SimpleTransmission</type>
+//   <joint name="Joint1">
+//     <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+//   </joint>
+//   <actuator name="joint1_motor">
+//     <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+//     <mechanicalReduction>50</mechanicalReduction>  <!-- Gear ratio -->
+//   </actuator>
+// </transmission>
+//
+// Additional motor properties (not standard URDF, but used by Gazebo):
+// <gazebo reference="Joint1">
+//   <implicitSpringDamper>true</implicitSpringDamper>
+//   <provideFeedback>true</provideFeedback>
+//   <dampingFactor>0.01</dampingFactor>
+//   <maxTorque>2.0</maxTorque>
+// </gazebo>
+//
+// Why We Don't Use URDF for Motor Dynamics Here:
+// -----------------------------------------------
+// 1. Standard URDF doesn't include motor bandwidth, friction models
+// 2. Gazebo-specific tags only work in Gazebo simulation
+// 3. Pinocchio doesn't parse <transmission> or <gazebo> tags
+// 4. We want explicit control over motor model for learning purposes
+//
+// For production code, consider:
+// - ros2_control: Hardware abstraction with transmission support
+// - Gazebo: Full physics simulation with motor plugins
+// - Custom URDF parser to read motor parameters
+//
+// Current Approach:
+// -----------------
+// We manually model motor dynamics in code with configurable parameters.
+// This gives us flexibility and clarity about what's being simulated.
+// Motor parameters could be loaded from ROS parameters or a config file.
+//
+// ============================================================================
+
+// ============================================================================
 // INCLUDES - External libraries and ROS2 components
 // ============================================================================
 
@@ -214,6 +261,18 @@ public:
         state_.resize(model_.nq + model_.nv);  // nq = num positions, nv = num velocities
         state_ << q_init, v_init;  // Combine into single vector
         
+        // Initialize motor torque state (for first-order motor dynamics)
+        tau_actual_ = Eigen::Vector3d::Zero();  // Motors start at zero torque
+        
+        // Motor parameters (can be made configurable via ROS parameters)
+        tau_motor_time_constant_ = 0.01;  // 10ms response time (100 Hz bandwidth)
+        tau_max_ = 2.0;  // Maximum torque per joint (Nm) - adjust for your motors
+        friction_viscous_ = 0.01;  // Viscous friction coefficient
+        friction_coulomb_ = 0.05;  // Coulomb (static) friction (Nm)
+        
+        RCLCPP_INFO(this->get_logger(), "Motor parameters: τ_const=%.1fms, τ_max=%.1fNm",
+                    tau_motor_time_constant_ * 1000, tau_max_);
+        
         RCLCPP_INFO(this->get_logger(), "Initial configuration: [%.1f°, %.1f°, %.1f°]",
                     q_init[0] * 180.0/M_PI, q_init[1] * 180.0/M_PI, q_init[2] * 180.0/M_PI);
         
@@ -324,48 +383,55 @@ private:
         
         if (near_xy_plane) {
             // ================================================================
-            // CASE 1: Z ≈ 0 - Control Position + Roll (4D task space)
+            // CASE 1: Z ≈ 0 - Control X, Y Position + Roll (3D task space)
             // ================================================================
-            // System is redundant: 4 tasks, 3 joints
-            // Joint0 can control roll without affecting X,Y (since Z=0)
+            // System is SQUARE: 3 tasks, 3 joints
+            // When Z=0 (constrained), we swap Z control for Roll control
+            //   Instead of: [X, Y, Z] ← 3 DOF
+            //   We control: [X, Y, Roll] ← 3 DOF
+            // Joint0 rotation doesn't affect X,Y when Z=0 (only affects roll)
             
-            J.resize(4, 3);
-            J.topRows(3) = J_full.topRows(3);      // Linear velocities
-            J.row(3) = J_full.row(3);              // Angular velocity around X
+            J.resize(3, 3);
+            J.row(0) = J_full.row(0);      // X linear velocity
+            J.row(1) = J_full.row(1);      // Y linear velocity  
+            J.row(2) = J_full.row(3);      // Roll angular velocity (row 3 of full Jacobian)
             
-            J_dot.resize(4, 3);
-            J_dot.topRows(3) = J_dot_full.topRows(3);
-            J_dot.row(3) = J_dot_full.row(3);
+            J_dot.resize(3, 3);
+            J_dot.row(0) = J_dot_full.row(0);
+            J_dot.row(1) = J_dot_full.row(1);
+            J_dot.row(2) = J_dot_full.row(3);
             
             // Get current roll angle
             Eigen::Matrix3d R = data_.oMf[ee_frame_id_].rotation();
             double roll = std::atan2(R(2,1), R(2,2));
             
-            // Position + roll error
-            Eigen::Vector4d x_current;
-            x_current << x[0], x[1], x[2], roll;
+            // Task space: [X, Y, Roll]
+            Eigen::Vector3d x_current;
+            x_current << x[0], x[1], roll;
             
-            Eigen::Vector4d x_des_full;
-            x_des_full << x_des_[0], x_des_[1], x_des_[2], roll_des_;
+            Eigen::Vector3d x_des_full;
+            x_des_full << x_des_[0], x_des_[1], roll_des_;
             
-            Eigen::Vector4d x_err = x_des_full - x_current;
+            Eigen::Vector3d x_err = x_des_full - x_current;
             
             // Wrap roll error to [-π, π]
-            while (x_err[3] > M_PI) x_err[3] -= 2*M_PI;
-            while (x_err[3] < -M_PI) x_err[3] += 2*M_PI;
+            while (x_err[2] > M_PI) x_err[2] -= 2*M_PI;
+            while (x_err[2] < -M_PI) x_err[2] += 2*M_PI;
             
-            // Build 4×4 gain matrix
-            Eigen::Matrix4d Kp_full = Eigen::Matrix4d::Zero();
-            Kp_full.topLeftCorner(3,3) = Kp_;
-            Kp_full(3,3) = Kp_roll_;
+            // Build 3×3 gain matrix: [Kp_x, Kp_y, Kp_roll]
+            Eigen::Matrix3d Kp_full = Eigen::Matrix3d::Zero();
+            Kp_full(0,0) = Kp_(0,0);  // X gain
+            Kp_full(1,1) = Kp_(1,1);  // Y gain
+            Kp_full(2,2) = Kp_roll_;  // Roll gain
             
-            Eigen::Matrix4d Kd_full = Eigen::Matrix4d::Zero();
-            Kd_full.topLeftCorner(3,3) = Kd_;
-            Kd_full(3,3) = Kd_roll_;
+            Eigen::Matrix3d Kd_full = Eigen::Matrix3d::Zero();
+            Kd_full(0,0) = Kd_(0,0);  // X damping
+            Kd_full(1,1) = Kd_(1,1);  // Y damping
+            Kd_full(2,2) = Kd_roll_;  // Roll damping
             
             // Velocity error
-            Eigen::Vector4d xdot_des_full = Eigen::Vector4d::Zero();
-            Eigen::Vector4d xdot_err = xdot_des_full - J * v;
+            Eigen::Vector3d xdot_des_full = Eigen::Vector3d::Zero();
+            Eigen::Vector3d xdot_err = xdot_des_full - J * v;
             
             // PD control
             x_acc_des = Kp_full * x_err + Kd_full * xdot_err;
@@ -453,22 +519,58 @@ private:
         
         // Control torque using inverse dynamics:
         // τ = B(q)q̈_des + n(q,q̇)
-        // This is the torque that, if applied, produces desired acceleration
-        Eigen::VectorXd u = B * qddot_task + n;
+        // This is the DESIRED torque (what we want motors to produce)
+        Eigen::VectorXd tau_desired = B * qddot_task + n;
+        
+        // ====================================================================
+        // MOTOR DYNAMICS - Realistic actuator behavior
+        // ====================================================================
+        // Real motors don't instantly produce desired torque!
+        // They have:
+        //   1. Bandwidth limits (first-order lag): τ̇ = (τ_cmd - τ) / τ_motor
+        //   2. Torque saturation: |τ| ≤ τ_max
+        //   3. Friction: τ_friction = b·v + τ_c·sign(v)
+        //
+        // This makes simulation much more realistic!
+        
+        // Step 1: Apply torque saturation (motor limits)
+        Eigen::VectorXd tau_saturated = tau_desired.cwiseMax(-tau_max_).cwiseMin(tau_max_);
+        
+        // Step 2: First-order motor dynamics (bandwidth limit)
+        // Differential equation: τ̇_actual = (τ_saturated - τ_actual) / τ_motor
+        // Euler integration: τ_actual(t+dt) = τ_actual(t) + dt · τ̇_actual
+        // Note: This happens BEFORE the main dynamics integration
+        tau_actual_ += (tau_saturated - tau_actual_) / tau_motor_time_constant_ * dt_;
+        
+        // Step 3: Add friction effects
+        // Viscous friction: proportional to velocity
+        // Coulomb friction: constant, opposes motion
+        Eigen::VectorXd friction = friction_viscous_ * v;
+        for (int i = 0; i < v.size(); ++i) {
+            if (std::abs(v[i]) > 1e-3) {  // Only apply if moving
+                friction[i] += friction_coulomb_ * (v[i] > 0 ? 1.0 : -1.0);
+            }
+        }
+        
+        // Final torque applied to robot (what motors actually produce)
+        Eigen::VectorXd tau_actual = tau_actual_ - friction;
         
         // ====================================================================
         // FORWARD DYNAMICS - Compute actual resulting acceleration
         // ====================================================================
-        // Given applied torque u, what acceleration actually occurs?
-        // From equation of motion: B(q)q̈ = τ - n(q,q̇)
-        // Solve for q̈: q̈ = B⁻¹(τ - n)
+        // Given applied torque tau_actual, what acceleration actually occurs?
+        // From equation of motion: B(q)q̈ = τ_actual - n(q,q̇)
+        // Solve for q̈: q̈ = B⁻¹(τ_actual - n)
         //
-        // Why not just use qddot_task?
-        //   - Numerical errors, model mismatches, external forces
-        //   - In real robots: motor limits, friction, delays
-        //   - This simulates the "true" physics
+        // This is the "true" physics simulation:
+        //   - Takes actual motor torque (with dynamics, limits, friction)
+        //   - Computes resulting joint acceleration
+        //   - Integrator then updates position/velocity
+        //
+        // Note: We use τ_actual, not τ_desired!
+        // This is where motor imperfections affect the motion.
         
-        Eigen::VectorXd qddot = B.ldlt().solve(u - n);  // LDLT decomposition for symmetric B
+        Eigen::VectorXd qddot = B.ldlt().solve(tau_actual - n);  // LDLT decomposition for symmetric B
         
         // ====================================================================
         // RETURN DERIVATIVE: dstate/dt = [v, qddot]
@@ -678,6 +780,13 @@ private:
     state_type state_;           // Current [q, v] vector
     double time_;                // Current simulation time (s)
     double dt_;                  // Timestep (s)
+    
+    // Motor dynamics state and parameters
+    Eigen::Vector3d tau_actual_;        // Current motor torque (state variable)
+    double tau_motor_time_constant_;    // Motor response time (s)
+    double tau_max_;                    // Maximum torque per joint (Nm)
+    double friction_viscous_;           // Viscous friction coefficient
+    double friction_coulomb_;           // Coulomb friction magnitude (Nm)
     
     // ROS2 components
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_pub_;  // Publisher
