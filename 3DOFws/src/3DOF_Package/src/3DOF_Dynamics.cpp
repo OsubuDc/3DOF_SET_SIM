@@ -1,3 +1,6 @@
+//Variables in pubic can be overwritten when running the node, private variables cannot be changed when running the node.
+//In private are the variables that change over time during the execution of the node.
+
 #include "rclcpp/rclcpp.hpp"              // Main ROS2 C++ API: Node class, logging, timers
 #include "sensor_msgs/msg/joint_state.hpp" // Message type for publishing joint data (position, velocity, effort)
 #include "std_msgs/msg/header.hpp"        // Message header: timestamp and frame_id
@@ -50,12 +53,14 @@ Class 3DOF_Dynamics : public rclcpp::Node //inherits from rclcpp::Node, gaining 
         std::vector<std::string> joint_names_;  // Names from URDF
         
         // Control parameters
-        Eigen::Vector3d x_des_;      // Target end-effector position (m) [X, Y, Z]
+        Eigen::Vector3d pos_reference;      // Target end-effector position (m) [X, Y, Z]
         double roll_des_;            // Target roll angle around X-axis (rad)
-        Eigen::Vector4d xdot_des_;   // Target velocity [vx, vy, vz, omega_x] (m/s, rad/s)
-        Eigen::Vector4d xddot_des_;  // Target acceleration [ax, ay, az, alpha_x] (m/s², rad/s²)
-        Eigen::Matrix4d Kp_;         // Position + orientation gain matrix (4×4)
-        Eigen::Matrix4d Kd_;         // Velocity + angular velocity damping matrix (4×4)
+        Eigen::Vector3d vel_reference;   // Target velocity [vx, vy, vz] (m/s)
+        Eigen::Vector3d acc_reference;  // Target acceleration [ax, ay, az] (m/s²)
+        Eigen::Matrix3d Kp_;         // Position gain matrix (3×3)
+        Eigen::Matrix3d Kd_;         // Velocity damping matrix (3×3)
+        double Kp_roll_;             // Roll gain (only for Z≈0 case)
+        double Kd_roll_;             // Roll damping (only for Z≈0 case)
         
         // Joint limits
         Eigen::Vector3d q_min_;      // Lower joint limits (rad)
@@ -65,7 +70,14 @@ Class 3DOF_Dynamics : public rclcpp::Node //inherits from rclcpp::Node, gaining 
         state_type state_;           // Current [q, v] vector
         double time_;                // Current simulation time (s)
         double dt_;                  // Timestep (s)
-        
+            
+        // Motor dynamics state and parameters TO BE CHANGED CHECK DATASHEET
+        Eigen::Vector3d tau_actual_;        // Current motor torque (state variable)
+        double tau_motor_time_constant_;    // Motor response time (s)
+        double tau_max_;                    // Maximum torque per joint (Nm)
+        double friction_viscous_;           // Viscous friction coefficient
+        double friction_coulomb_;           // Coulomb friction magnitude (Nm)
+
         // ROS2 components
         rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_pub_;  // Publisher publishes message of type <something>. SharedPtr is a smart pointer that retains shared ownership of an object through a pointer. 
                                                                                 // Several SharedPtr objects may own the same object. The object is destroyed and its memory deallocated when either of the following happens: 
@@ -104,7 +116,59 @@ Class 3DOF_Dynamics : public rclcpp::Node //inherits from rclcpp::Node, gaining 
 
             if (near_xy_plane)
             {
+                J.resize(3,3); //resize bechause J does have a size yet.
+                J.row(0) = J_full.row(0);
+                J.row(1) = J_full.row(1);
+                J.row(2) = J_full.row(3); // z is replaced with roll (row 3 of full Jacobian)
+
+                J_dot.resize(3,3);
+                J_dot.row(0) = J_dot_full.row(0);
+                J_dot.row(1) = J_dot_full.row(1);
+                J_dot.row(2) = J_dot_full.row(3);
+
+                Eigen::Matrix3d R = data_.oMf[ee_frame_id_].rotation(); //rotation matrix of end-effector frame
+                //transformation matrix is always the same, but euler angles depend on the rotation order you choose.
+                //pinocchio uses ZYX rotation order by default (yaw-pitch-roll)
+                //https://en.wikipedia.org/wiki/Euler_angles#cite_note-4
+                double roll = std::atan2(R(2,1), R(2,2)); //compute roll angle from rotation matrix
                 
+                Eigen::Vector3d x_current;
+                x_current << x[0], x[1], roll; //current end-effector position + roll angle
+
+                Eigen::Vector3d pos_desired_full;
+                pos_desired_full << pos_desired[0], pos_desired[1], roll_des_; //desired end-effector position + roll angle
+
+                Eigen::Vector3d x_err = pos_desired_full - x_current; //position error + roll error
+                
+                Eigen::Vector3d xdot_des_full = Eigen::Vector3d::Zero();
+                Eigen::Vector3d xdot_err = xdot_des_full - J * v; //velocity error + roll velocity error
+
+                Eigen::Vector3d xddot_des_full = Eigen::Vector3d::Zero(); //desired acceleration + roll angular acceleration
+
+                //470degrees is the same physically as 470-360=110 degrees.
+                while (x_err[2] > M_PI) x_err[2] -= 2*M_PI;
+                while (x_err[2] < -M_PI) x_err[2] += 2*M_PI;
+                
+                Eigen::Matrix3d Kp_full = Eigen::Matrix3d::Zero();
+                Kp_full(0,0) = Kp_(0,0); //X gain
+                Kp_full(1,1) = Kp_(1,1); //Y gain
+                Kp_full(2,2) = Kp_roll_; //Roll gain
+                
+                Eigen::Matrix3d Kd_full = Eigen::Matrix3d::Zero();
+                Kd_full(0,0) = Kd_(0,0);  // X damping
+                Kd_full(1,1) = Kd_(1,1);  // Y damping
+                Kd_full(2,2) = Kd_roll_;  // Roll damping
+
+                x_acc_des = xddot_des_full + Kp_full * x_err + Kd_full * xdot_err;
+            } else {
+                J = J_full.topRows(3);
+                J_dot = J_dot_full.topRows(3);
+
+                Eigen::Vector3d x_err = pos_desired - x;
+                Eigen::Vector3d xdot_err = vel_desired - J * v;
+                
+                x_acc_des = acc_reference + Kp_ * x_err + Kd_ * xdot_err;
+                      
             }
         }
 
@@ -183,8 +247,8 @@ Class 3DOF_Dynamics : public rclcpp::Node //inherits from rclcpp::Node, gaining 
             q_max_ = Eigen::Vector3d(M_PI, 1.57, -2.6);     //joint upper limits
                                                             //M_PI is a constant defined in cmath representing the value of pi (3.14159...)
             RCLCPP_INFO(this->get_logger(), "Target position: [%.3f, %.3f, %.3f]", 
-                        x_des_[0], x_des_[1], x_des_[2]); //%.3f is used to print floating-point numbers with 3 decimal places. The % means that the value will be replaced by the corresponding argument after the format string.
-            if (std::abs(x_des_[2]) < 0.005) {
+                        pos_desired[0], pos_desired[1], pos_desired[2]); //%.3f is used to print floating-point numbers with 3 decimal places. The % means that the value will be replaced by the corresponding argument after the format string.
+            if (std::abs(pos_desired[2]) < 0.005) {
                 RCLCPP_INFO(this->get_logger(), "Target is near Z=0, will control roll angle: %.1f°", //%.1f is used to print floating-point numbers with 1 decimal place.
                             roll_des_ * 180.0/M_PI);
             }

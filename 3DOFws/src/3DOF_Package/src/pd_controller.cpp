@@ -433,8 +433,13 @@ private:
             Eigen::Vector3d xdot_des_full = Eigen::Vector3d::Zero();
             Eigen::Vector3d xdot_err = xdot_des_full - J * v;
             
-            // PD control
-            x_acc_des = Kp_full * x_err + Kd_full * xdot_err;
+            // PD control with feedforward
+            // Complete control law: u = u_ff + Kp*e + Kd*ė
+            // For stationary target: u_ff = 0
+            Eigen::Vector3d xddot_des_full = Eigen::Vector3d::Zero();  // Reference acceleration
+            x_acc_des = xddot_des_full + Kp_full * x_err + Kd_full * xdot_err;
+            //          ↑ Feedforward    ↑ Proportional   ↑ Derivative
+            //          (zero for stationary target)
             
         } else {
             // ================================================================
@@ -452,8 +457,12 @@ private:
             // Velocity error
             Eigen::Vector3d xdot_err = xdot_des_ - J * v;
             
-            // PD control
-            x_acc_des = Kp_ * x_err + Kd_ * xdot_err;
+            // PD control with feedforward
+            // Complete control law: u = u_ff + Kp*e + Kd*ė
+            // For stationary target: u_ff = xddot_des = 0
+            x_acc_des = xddot_des_ + Kp_ * x_err + Kd_ * xdot_err;
+            //          ↑ Feedforward  ↑ Proportional  ↑ Derivative
+            //          (zero for stationary target)
         }
         
         // ====================================================================
