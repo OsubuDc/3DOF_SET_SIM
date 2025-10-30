@@ -94,8 +94,18 @@ Class 3DOF_Dynamics : public rclcpp::Node //inherits from rclcpp::Node, gaining 
             Eigen::MatrixXd J_full = pin::computeFrameJacobian(model_,data_,q,ee_frame_id_,pin::LOCAL_WORLD_ALIGNED); // Compute full 6xN Jacobian for end-effector frame in world-aligned coordinates
             //end-effector position
             Eigen::Vector3d x = data.oMf[ee_frame_id_].translation (); // data.oMf[i] gives the transformation matrix of frame i. .translation() extracts the translation vector (position) from the transformation matrix.
-            //LINE 313 other code
             
+            double z_threshold = 0.005; // 5mm threshold for "near X-Y plane"
+            bool near_xy_plane = std::abs(x[2]) < z_threshold; //check if z coordinate of end-effector is less than threshold
+                                                               // If z < treshold, bool will be true, else false.
+            Eigen::VectorXd x_acc_des; //desired end-effector acceleration
+            Eigen::MatrixXd J; //Jacobian matrix. Xd means the size of the matrix is dynamic (can change at runtime)
+            Eigen::MatrixXd J_dot; //time derivative of Jacobian matrix
+
+            if (near_xy_plane)
+            {
+                
+            }
         }
 
         
@@ -109,7 +119,7 @@ Class 3DOF_Dynamics : public rclcpp::Node //inherits from rclcpp::Node, gaining 
         {
             this->declare_parameter<std::string>("urdf_path", 
             "/3DOF_SET_SIM/3DOFws/urdf/AssemblyVersion3.2.urdf");
-            this->declare_parameter<std::string>("mesh_dir", 
+            this->declare_parameter<std::string>("mesh_dir",      
             "/3DOF_SET_SIM/3DOFws/mesh");
             //you need to use declare_parameter to register parameters with the ROS2 parameter server. This allows you to define parameters that can be set externally (e.g., via command line or configuration files) and retrieved within your node.
             //(here you write the parameter name as it will appear in ROS2 , and here you write the default value of the parameter)
