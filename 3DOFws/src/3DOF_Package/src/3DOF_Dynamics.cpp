@@ -1,4 +1,5 @@
 //Variables in pubic can be overwritten when running the node, private variables cannot be changed when running the node.
+//variables with _ are used as member variables and don't change over time, they are constants. Variables in functions without _ are local variables and change over time.
 //In private are the variables that change over time during the execution of the node.
 
 #include "rclcpp/rclcpp.hpp"              // Main ROS2 C++ API: Node class, logging, timers
@@ -39,9 +40,8 @@ typedef Eigen::VectorXd state_type; //typedef is used to create an alias for a d
                                     //A "type" is a classification identifying one of various types of data, such as integer, floating-point, or user-defined types like classes and structures. In programming, types define the operations that can be performed on the data and how the data is stored in memory.
                                     //Difference between a class and a type: A class is a blueprint for creating objects, encapsulating data and behavior, while a type is a broader concept that defines the nature of data, including primitive types (like int, float) and user-defined types (like classes and structs).
 
-Class 3DOF_Dynamics : public rclcpp::Node //inherits from rclcpp::Node, gaining all ROS2 node capabilities. We use public inheritance so that all public and protected members of rclcpp::Node are accessible in 3DOF_Dynamics.
+class ThreeDOF_Dynamics : public rclcpp::Node //inherits from rclcpp::Node, gaining all ROS2 node capabilities. We use public inheritance so that all public and protected members of rclcpp::Node are accessible in 3DOF_Dynamics.
 {
-    
     private: //visibility specifier: members declared under private can only be accessed from within the class itself.
         
         // Pinocchio model and data
@@ -53,14 +53,14 @@ Class 3DOF_Dynamics : public rclcpp::Node //inherits from rclcpp::Node, gaining 
         std::vector<std::string> joint_names_;  // Names from URDF
         
         // Control parameters
-        Eigen::Vector3d pos_reference;      // Target end-effector position (m) [X, Y, Z]
-        double roll_des_;            // Target roll angle around X-axis (rad)
-        Eigen::Vector3d vel_reference;   // Target velocity [vx, vy, vz] (m/s)
-        Eigen::Vector3d acc_reference;  // Target acceleration [ax, ay, az] (m/s²)
-        Eigen::Matrix3d Kp_;         // Position gain matrix (3×3)
-        Eigen::Matrix3d Kd_;         // Velocity damping matrix (3×3)
-        double Kp_roll_;             // Roll gain (only for Z≈0 case)
-        double Kd_roll_;             // Roll damping (only for Z≈0 case)
+        Eigen::Vector3d pos_target_;  // Target end-effector position (m) [X, Y, Z]
+        Eigen::Vector3d vel_target_;  // Target velocity [vx, vy, vz] (m/s)
+        Eigen::Vector3d acc_target_;  // Target acceleration [ax, ay, az] (m/s²)
+        double roll_target_;               // Target roll angle around X-axis (rad)
+        Eigen::Matrix3d Kp_;            // Position gain matrix (3×3)
+        Eigen::Matrix3d Kd_;            // Velocity damping matrix (3×3)
+        double Kp_roll_;                // Roll gain (only for Z≈0 case)
+        double Kd_roll_;                // Roll damping (only for Z≈0 case)
         
         // Joint limits
         Eigen::Vector3d q_min_;      // Lower joint limits (rad)
@@ -105,23 +105,24 @@ Class 3DOF_Dynamics : public rclcpp::Node //inherits from rclcpp::Node, gaining 
             //computeFrameJacobian(here you write the model, data, joint positions, frame id, reference frame)
             Eigen::MatrixXd J_full = pin::computeFrameJacobian(model_,data_,q,ee_frame_id_,pin::LOCAL_WORLD_ALIGNED); // Compute full 6xN Jacobian for end-effector frame in world-aligned coordinates
             //end-effector position
-            Eigen::Vector3d x = data.oMf[ee_frame_id_].translation (); // data.oMf[i] gives the transformation matrix of frame i. .translation() extracts the translation vector (position) from the transformation matrix.
+            Eigen::Vector3d x = data_.oMf[ee_frame_id_].translation (); // data.oMf[i] gives the transformation matrix of frame i. .translation() extracts the translation vector (position) from the transformation matrix.
             
             double z_threshold = 0.005; // 5mm threshold for "near X-Y plane"
             bool near_xy_plane = std::abs(x[2]) < z_threshold; //check if z coordinate of end-effector is less than threshold
                                                                // If z < treshold, bool will be true, else false.
-            Eigen::VectorXd x_acc_des; //desired end-effector acceleration
+            Eigen::VectorXd x_acc_output; //desired end-effector acceleration
             Eigen::MatrixXd J; //Jacobian matrix. Xd means the size of the matrix is dynamic (can change at runtime)
             Eigen::MatrixXd J_dot; //time derivative of Jacobian matrix
-
+            
+            J.resize(3,3); //resize bechause J does have a size yet.
+            J_dot.resize(3,3);
+           
             if (near_xy_plane)
             {
-                J.resize(3,3); //resize bechause J does have a size yet.
                 J.row(0) = J_full.row(0);
                 J.row(1) = J_full.row(1);
                 J.row(2) = J_full.row(3); // z is replaced with roll (row 3 of full Jacobian)
 
-                J_dot.resize(3,3);
                 J_dot.row(0) = J_dot_full.row(0);
                 J_dot.row(1) = J_dot_full.row(1);
                 J_dot.row(2) = J_dot_full.row(3);
@@ -132,44 +133,59 @@ Class 3DOF_Dynamics : public rclcpp::Node //inherits from rclcpp::Node, gaining 
                 //https://en.wikipedia.org/wiki/Euler_angles#cite_note-4
                 double roll = std::atan2(R(2,1), R(2,2)); //compute roll angle from rotation matrix
                 
-                Eigen::Vector3d x_current;
-                x_current << x[0], x[1], roll; //current end-effector position + roll angle
+                Eigen::Vector3d x_roll;
+                x_roll << x[0], x[1], roll; //current end-effector position + roll angle
 
-                Eigen::Vector3d pos_desired_full;
-                pos_desired_full << pos_desired[0], pos_desired[1], roll_des_; //desired end-effector position + roll angle
+                Eigen::Vector3d pos_out_roll;
+                pos_out_roll << pos_target_[0], pos_target_[1], roll_target_; //desired end-effector position + roll angle
 
-                Eigen::Vector3d x_err = pos_desired_full - x_current; //position error + roll error
+                Eigen::Vector3d x_err = pos_out_roll - x_roll; //position error + roll error
                 
-                Eigen::Vector3d xdot_des_full = Eigen::Vector3d::Zero();
-                Eigen::Vector3d xdot_err = xdot_des_full - J * v; //velocity error + roll velocity error
+                Eigen::Vector3d xdot_out_roll = Eigen::Vector3d::Zero();
+                Eigen::Vector3d xdot_err = xdot_out_roll - J * v; //velocity error + roll velocity error
 
-                Eigen::Vector3d xddot_des_full = Eigen::Vector3d::Zero(); //desired acceleration + roll angular acceleration
+                Eigen::Vector3d xddot_out_roll = Eigen::Vector3d::Zero(); //desired acceleration + roll angular acceleration
 
                 //470degrees is the same physically as 470-360=110 degrees.
                 while (x_err[2] > M_PI) x_err[2] -= 2*M_PI;
                 while (x_err[2] < -M_PI) x_err[2] += 2*M_PI;
                 
-                Eigen::Matrix3d Kp_full = Eigen::Matrix3d::Zero();
-                Kp_full(0,0) = Kp_(0,0); //X gain
-                Kp_full(1,1) = Kp_(1,1); //Y gain
-                Kp_full(2,2) = Kp_roll_; //Roll gain
+                Eigen::Matrix3d Kp_roll = Eigen::Matrix3d::Zero();
+                Kp_roll(0,0) = Kp_(0,0); //X gain
+                Kp_roll(1,1) = Kp_(1,1); //Y gain
+                Kp_roll(2,2) = Kp_roll_; //Roll gain
                 
-                Eigen::Matrix3d Kd_full = Eigen::Matrix3d::Zero();
-                Kd_full(0,0) = Kd_(0,0);  // X damping
-                Kd_full(1,1) = Kd_(1,1);  // Y damping
-                Kd_full(2,2) = Kd_roll_;  // Roll damping
+                Eigen::Matrix3d Kd_roll = Eigen::Matrix3d::Zero();
+                Kd_roll(0,0) = Kd_(0,0);  // X damping
+                Kd_roll(1,1) = Kd_(1,1);  // Y damping
+                Kd_roll(2,2) = Kd_roll_;  // Roll damping
 
-                x_acc_des = xddot_des_full + Kp_full * x_err + Kd_full * xdot_err;
+                x_acc_output = xddot_out_roll + Kp_rol * x_err + Kd_roll * xdot_err;
             } else {
                 J = J_full.topRows(3);
                 J_dot = J_dot_full.topRows(3);
 
-                Eigen::Vector3d x_err = pos_desired - x;
+                Eigen::Vector3d x_err = pos_out_roll - x;
                 Eigen::Vector3d xdot_err = vel_desired - J * v;
                 
-                x_acc_des = acc_reference + Kp_ * x_err + Kd_ * xdot_err;
-                      
+                x_acc_output = acc_target_ + Kp_ * x_err + Kd_ * xdot_err; //external coordinates acceleration: ẍ
+                                                                           //y= q" which is internal coordinates acceleration 
             }
+
+            Eigen::Matrix3d B = pin::crba(model_, data_, q); // Mass matrix (inertia). crba = composite rigid body algorithm
+            Eigen::VectorXd n = pin::rnea(model_, data_, q, v, Eigen::VectorXd::Zero(model_.nv)); // Dynammic components. rnea = recursive newton-euler algorithm
+                                                                                                  //rnea(model, data, q, v, a). a = 0. https://scaron.info/robotics/recursive-newton-euler-algorithm.html
+            Eigen::Vector3d acc_task;
+
+            if (J.rows() == 3 && J.cols() == 3) {
+                double det_J = J.determinant();
+                acc_task = J.inverse() * (x_acc_output - J_dot * v) //internal coordinates acceleration
+            } else {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Not a square matrix"); //this->get_logger() => pointer to the node's clock. *this->get_clock() => actual rclpp::Clock object of that node.
+            }
+
+            Eigen::VectorXd u_torque_output = B * acc_task + n;
+//533
         }
 
         
@@ -232,10 +248,10 @@ Class 3DOF_Dynamics : public rclcpp::Node //inherits from rclcpp::Node, gaining 
                         model_.frames[ee_frame_id_].name.c_str());
             }
 
-            pos_desired = Eigen::Vector3d(0.2,0.2,0.2); //desired end-effector position
-            vel_desired = Eigen::Vector3d(0.0,0.0,0.0); //desired end-effector velocity
-            acc_desired = Eigen::Vector3d(0.0,0.0,0.0); //desired end-effector acceleration
-            roll_des_ = 0.0; //desired roll angle around X-axis. Only used when Z is zero (one control parameter is lost in a 3DOF arm, meaning we can control rotation around first joint when the end-effector is in the x-y plane)
+            pos_target_ = Eigen::Vector3d(0.2,0.2,0.2); //desired end-effector position
+            vel_target_ = Eigen::Vector3d(0.0,0.0,0.0); //desired end-effector velocity
+            acc_target_ = Eigen::Vector3d(0.0,0.0,0.0); //desired end-effector acceleration
+            roll_target_ = 0.0; //desired roll angle around X-axis. Only used when Z is zero (one control parameter is lost in a 3DOF arm, meaning we can control rotation around first joint when the end-effector is in the x-y plane)
 
             Kp_ = Eigen::Matrix3d::Identity() * 50.0;  // 3×3 for X, Y, Z
             Kd_ = Eigen::Matrix3d::Identity() * 40.0;
@@ -250,7 +266,7 @@ Class 3DOF_Dynamics : public rclcpp::Node //inherits from rclcpp::Node, gaining 
                         pos_desired[0], pos_desired[1], pos_desired[2]); //%.3f is used to print floating-point numbers with 3 decimal places. The % means that the value will be replaced by the corresponding argument after the format string.
             if (std::abs(pos_desired[2]) < 0.005) {
                 RCLCPP_INFO(this->get_logger(), "Target is near Z=0, will control roll angle: %.1f°", //%.1f is used to print floating-point numbers with 1 decimal place.
-                            roll_des_ * 180.0/M_PI);
+                            roll_target_ * 180.0/M_PI);
             }
             RCLCPP_WARN(this->get_logger(), "Joint limits: [%.0f°, %.0f°, %.0f°] to [%.0f°, %.0f°, %.0f°]", //%.0f is used to print floating-point numbers with no decimal places.
                         q_min_[0] * 180.0/M_PI, q_min_[1] * 180.0/M_PI, q_min_[2] * 180.0/M_PI,
