@@ -185,7 +185,10 @@ class ThreeDOF_Dynamics : public rclcpp::Node //inherits from rclcpp::Node, gain
             }
 
             Eigen::VectorXd u_torque_output = B * acc_task + n;
-//533
+            Eigen::VectorXd tau_saturated = u_torque_output.cwiseMax(-tau_max_).cwiseMin(tau_max_); //saturate torques to max torque limits
+            //cwiseMax = result[i] = std::max(this[i], x[i]); cwiseMin = result[i] = std::min(this[i], x[i]);
+            //for lower and upper limits:  ciwsieMax (= if value < lower limit, set to lower limit) and cwiseMin (if value > upper limit, set to upper limit)
+            
         }
 
         
